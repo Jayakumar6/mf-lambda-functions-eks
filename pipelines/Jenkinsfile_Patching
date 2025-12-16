@@ -40,7 +40,42 @@ pipeline {
             }
         }
 
-        stage('2. Pre-Check: Workload Health') {
+        stage('2. Sync & Validate AMI') {
+            steps {
+                script {
+                    def cluster_param_name = "eks-ami/${params.CLUSTER_NAME}"
+                    echo "Syncing Golden AMI (${env.AMI_ID}) to Target Parameter: ${cluster_param_name}..."
+                    
+                    // Use Target Profile
+                    withEnv(["AWS_PROFILE=${TARGET_PROFILE}"]) {
+                        // 1. Get Current Cluster Logic
+                        def current_ami = sh(
+                            script: "aws ssm get-parameter --name ${cluster_param_name} --query 'Parameter.Value' --output text || echo 'NOT_FOUND'",
+                            returnStdout: true
+                        ).trim()
+                        
+                        echo "Current Cluster AMI: ${current_ami}"
+                        
+                        // 2. Compare & Update
+                        if (current_ami != env.AMI_ID) {
+                            echo "⚠️ AMI Mismatch! Updating Cluster Parameter Store..."
+                            sh """
+                                aws ssm put-parameter \
+                                    --name "${cluster_param_name}" \
+                                    --value "${env.AMI_ID}" \
+                                    --type "String" \
+                                    --overwrite
+                            """
+                            echo "✅ Updated ${cluster_param_name} to ${env.AMI_ID}"
+                        } else {
+                            echo "✅ AMI is already up-to-date in Cluster Parameter Store."
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('3. Pre-Check: Workload Health') {
             steps {
                 script {
                     echo "Checking Workload Health in Target Account: ${params.TARGET_ACCOUNT_ID}..."
@@ -65,7 +100,7 @@ pipeline {
             }
         }
 
-        stage('3. Invoke Patching Lambda') {
+        stage('4. Invoke Patching Lambda') {
             steps {
                 script {
                     echo "Invoking Lambda ${params.LAMBDA_FUNCTION_NAME}..."
@@ -96,7 +131,7 @@ pipeline {
             }
         }
 
-        stage('4. Monitor Update Status') {
+        stage('5. Monitor Update Status') {
             steps {
                 script {
                     echo "Monitoring Node Group Updates in Target Account..."
@@ -242,7 +277,7 @@ if __name__ == "__main__":
             }
         }
 
-        stage('5. Post-Check: Workload Health') {
+        stage('6. Post-Check: Workload Health') {
             steps {
                 script {
                     echo "Verifying Workloads after Patching..."
