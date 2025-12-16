@@ -1,0 +1,58 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Cross-Account Role for Central EKS Patching Lambda'
+
+Parameters:
+  CentralAccountID:
+    Type: String
+    Description: 'The AWS Account ID where the Central Lambda Function resides (Common Account)'
+    AllowedPattern: '^\d{12}$'
+
+  CentralLambdaRoleName:
+    Type: String
+    Default: 'eks-patching-lambda-role'
+    Description: 'The name of the IAM Role attached to the Central Lambda function'
+
+Resources:
+  CrossAccountPatcherRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: 'CrossAccount-EKS-Patcher-Role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${CentralAccountID}:role/${CentralLambdaRoleName}'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'EKSPatchingPermissions'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'eks:ListNodegroups'
+                  - 'eks:DescribeNodegroup'
+                  - 'eks:UpdateNodegroupVersion'
+                  - 'eks:DescribeUpdate'
+                  - 'eks:ListClusters'
+                  - 'eks:DescribeCluster'
+                  - 'ec2:CreateLaunchTemplateVersion'
+                  - 'ec2:DescribeLaunchTemplates'
+                  - 'ec2:DescribeLaunchTemplateVersions'
+                  - 'ec2:RunInstances'
+                  - 'ec2:DescribeImages'
+                  - 'ec2:DescribeInstances'
+                  - 'ec2:DescribeSubnets'
+                  - 'ec2:DescribeSecurityGroups'
+                  - 'ec2:DescribeKeyPairs'
+                  - 'ec2:DescribeNetworkInterfaces'
+                  - 'ec2:CreateTags'
+                  - 'ssm:GetParameter'
+                  - 'iam:PassRole'
+                Resource: '*'
+
+Outputs:
+  RoleARN:
+    Description: 'The ARN of the cross-account role to be used by the Central Lambda'
+    Value: !GetAtt CrossAccountPatcherRole.Arn

@@ -1,0 +1,194 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'INSTANCE_ID', description: 'EC2 Instance ID to create AMI from (e.g., i-0123456789abcdef0)')
+        string(name: 'AMI_NAME', description: 'Name for the new AMI (e.g., eks-golden-image-v1)')
+        string(name: 'AMI_DESCRIPTION', defaultValue: 'Golden Image for EKS Nodes', description: 'Description for the AMI')
+        string(name: 'PARAMETER_NAME', defaultValue: 'eks-golden-image', description: 'SSM Parameter Name to update with new AMI ID')
+        string(name: 'SHARE_ACCOUNTS', description: 'Comma-separated list of AWS Account IDs to share the AMI with')
+        string(name: 'SNS_TOPIC_ARN', description: 'ARN of the SNS Topic for notifications')
+        string(name: 'LAMBDA_FUNCTION_NAME', defaultValue: 'AMI-Creator-Function', description: 'Name of the AMI Creator Lambda Function')
+        string(name: 'REGION', defaultValue: 'ap-south-1', description: 'AWS Region')
+    }
+
+    environment {
+        AWS_DEFAULT_REGION = "${params.REGION}"
+        // Use Hub Profile for AMI Creation
+        AWS_PROFILE = "jai"
+    }
+
+    stages {
+        stage('1. Validate Inputs') {
+            steps {
+                script {
+                    if (!params.INSTANCE_ID) {
+                        error "INSTANCE_ID is required!"
+                    }
+                    echo "Instance ID: ${params.INSTANCE_ID}"
+                    echo "AMI Name: ${params.AMI_NAME}"
+                }
+            }
+        }
+
+        stage('2. Invoke AMI Creator Lambda') {
+            steps {
+                script {
+                    echo "Invoking Lambda ${params.LAMBDA_FUNCTION_NAME} asynchronously..."
+                    
+                    def payload = """
+                    {
+                        "instance_id": "${params.INSTANCE_ID}",
+                        "ami_name": "${params.AMI_NAME}",
+                        "ami_description": "${params.AMI_DESCRIPTION}",
+                        "parameter_name": "${params.PARAMETER_NAME}",
+                        "share_accounts": "${params.SHARE_ACCOUNTS}",
+                        "sns_topic_arn": "${params.SNS_TOPIC_ARN}"
+                    }
+                    """
+                    
+                    // Invoke Lambda Asynchronously (Event)
+                    try {
+                        sh """
+                            aws lambda invoke \
+                                --function-name ${params.LAMBDA_FUNCTION_NAME} \
+                                --invocation-type Event \
+                                --payload '${payload}' \
+                                --cli-binary-format raw-in-base64-out \
+                                response.json
+                        """
+                        echo "✅ Lambda Invoked Successfully (Async)"
+                    } catch (Exception e) {
+                        error "Failed to invoke Lambda: ${e.message}"
+                    }
+                }
+            }
+        }
+
+        stage('3. Monitor AMI Status (Mumbai)') {
+            steps {
+                script {
+                    echo "Looking for AMI with name: ${params.AMI_NAME} in ap-south-1..."
+                    
+                    def ami_id = ""
+                    
+                    // Loop to find the AMI ID first
+                    for (int i = 0; i < 10; i++) {
+                        try {
+                            ami_id = sh(
+                                script: "aws ec2 describe-images --filters \"Name=name,Values=${params.AMI_NAME}\" --query 'Images[0].ImageId' --output text", 
+                                returnStdout: true
+                            ).trim()
+                            
+                            if (ami_id && ami_id != "None") {
+                                echo "✅ Found AMI ID: ${ami_id}"
+                                break
+                            }
+                        } catch (Exception e) {
+                            echo "Waiting for AMI to appear..."
+                        }
+                        sleep 10
+                    }
+                    
+                    if (!ami_id || ami_id == "None") {
+                        error "❌ Could not find AMI with name ${params.AMI_NAME} after invocation."
+                    }
+                    
+                    env.NEW_AMI_ID = ami_id
+
+                    echo "Monitoring AMI Status for ${ami_id}..."
+                    
+                    // Loop for up to 30 minutes
+                    for (int i = 0; i < 60; i++) {
+                        def status = sh(
+                            script: "aws ec2 describe-images --image-ids ${ami_id} --query 'Images[0].State' --output text", 
+                            returnStdout: true
+                        ).trim()
+                        
+                        echo "Time: ${new Date()} - AMI Status: ${status}"
+                        
+                        if (status == 'available') {
+                            echo "✅ AMI is AVAILABLE!"
+                            return
+                        } else if (status == 'failed') {
+                            error "❌ AMI Creation FAILED!"
+                        }
+                        
+                        sleep 30
+                    }
+                    
+                    error "⚠️ AMI is still ${status} after 30 minutes. Timeout."
+                }
+            }
+        }
+
+        stage('4. Monitor DR AMI Status (Hyderabad)') {
+            steps {
+                script {
+                    echo "Waiting for DR AMI (Hyderabad) creation to start..."
+                    echo "Note: Copy starts only after Mumbai AMI is available."
+                    
+                    def dr_ami_id = ""
+                    
+                    // Loop to find the AMI ID in ap-south-2
+                    // We wait up to 10 minutes for the copy to be initiated
+                    for (int i = 0; i < 20; i++) {
+                        try {
+                            dr_ami_id = sh(
+                                script: "aws ec2 describe-images --region ap-south-2 --filters \"Name=name,Values=${params.AMI_NAME}\" --query 'Images[0].ImageId' --output text", 
+                                returnStdout: true
+                            ).trim()
+                            
+                            if (dr_ami_id && dr_ami_id != "None") {
+                                echo "✅ Found DR AMI ID: ${dr_ami_id}"
+                                break
+                            }
+                        } catch (Exception e) {
+                            // Ignore error if image not found yet
+                        }
+                        echo "Waiting for DR AMI to appear in ap-south-2... (Attempt ${i+1}/20)"
+                        sleep 30
+                    }
+                    
+                    if (!dr_ami_id || dr_ami_id == "None") {
+                        error "❌ Could not find DR AMI with name ${params.AMI_NAME} in ap-south-2 after waiting. Copy might have failed."
+                    }
+                    
+                    env.DR_AMI_ID = dr_ami_id
+
+                    echo "Monitoring DR AMI Status for ${dr_ami_id}..."
+                    
+                    // Loop for up to 30 minutes
+                    for (int i = 0; i < 60; i++) {
+                        def status = sh(
+                            script: "aws ec2 describe-images --region ap-south-2 --image-ids ${dr_ami_id} --query 'Images[0].State' --output text", 
+                            returnStdout: true
+                        ).trim()
+                        
+                        echo "Time: ${new Date()} - DR AMI Status: ${status}"
+                        
+                        if (status == 'available') {
+                            echo "✅ DR AMI is AVAILABLE!"
+                            return
+                        } else if (status == 'failed') {
+                            error "❌ DR AMI Creation FAILED!"
+                        }
+                        
+                        sleep 30
+                    }
+                    
+                    error "⚠️ DR AMI is still ${status} after 30 minutes. Timeout."
+                }
+            }
+        }
+    }
+
+    post {
+        failure {
+            echo "❌ Pipeline Failed!"
+        }
+        success {
+            echo "✅ AMI Creation Pipeline Completed Successfully."
+        }
+    }
+}
