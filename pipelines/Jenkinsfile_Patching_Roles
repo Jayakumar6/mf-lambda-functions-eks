@@ -1,0 +1,354 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'TARGET_ACCOUNT_ID', description: 'AWS Account ID where the EKS Cluster resides')
+        string(name: 'CLUSTER_NAME', description: 'Name of the EKS Cluster to patch')
+        string(name: 'COMMON_ACCOUNT_ID', description: 'AWS Account ID where the Lambda and AMI reside')
+        string(name: 'AMI_PARAM_NAME', defaultValue: 'eks-golden-image', description: 'SSM Parameter Name for Golden AMI')
+        string(name: 'LAMBDA_FUNCTION_NAME', defaultValue: 'EKS-NodeGroup-Patcher', description: 'Name of the Patching Lambda Function')
+        string(name: 'TARGET_ROLE_NAME', defaultValue: 'CrossAccount-EKS-Patcher-Role', description: 'Role to assume in Target Account (by Lambda)')
+        string(name: 'SNS_TOPIC_ARN', description: 'ARN of SNS Topic for notifications')
+        string(name: 'REGION', defaultValue: 'ap-south-1', description: 'AWS Region')
+        
+        // Roles for Jenkins to assume
+        string(name: 'HUB_ROLE_ARN', description: 'IAM Role ARN to assume for Hub Account operations')
+        string(name: 'TARGET_ROLE_ARN', description: 'IAM Role ARN to assume for Target Account operations')
+    }
+
+    environment {
+        AWS_DEFAULT_REGION = "${params.REGION}"
+    }
+
+    stages {
+        stage('1. Pre-Check: Golden AMI') {
+            steps {
+                script {
+                    echo "Checking for Golden AMI in Common Account: ${params.COMMON_ACCOUNT_ID}..."
+                    // Use Hub Role
+                    withAwsRole(params.HUB_ROLE_ARN) {
+                        def ami_id = sh(
+                            script: "aws ssm get-parameter --name ${params.AMI_PARAM_NAME} --query 'Parameter.Value' --output text",
+                            returnStdout: true
+                        ).trim()
+                        
+                        if (!ami_id) {
+                            error "Golden AMI ID not found in parameter: ${params.AMI_PARAM_NAME}"
+                        }
+                        echo "✅ Found Golden AMI ID: ${ami_id}"
+                        env.AMI_ID = ami_id
+                    }
+                }
+            }
+        }
+
+        stage('2. Sync & Validate AMI') {
+            steps {
+                script {
+                    def cluster_param_name = "eks-ami/${params.CLUSTER_NAME}"
+                    echo "Syncing Golden AMI (${env.AMI_ID}) to Target Parameter: ${cluster_param_name}..."
+                    
+                    // Use Target Role
+                    withAwsRole(params.TARGET_ROLE_ARN) {
+                        // 1. Get Current Cluster Logic
+                        def current_ami = sh(
+                            script: "aws ssm get-parameter --name ${cluster_param_name} --query 'Parameter.Value' --output text || echo 'NOT_FOUND'",
+                            returnStdout: true
+                        ).trim()
+                        
+                        echo "Current Cluster AMI: ${current_ami}"
+                        
+                        // 2. Compare & Update
+                        if (current_ami != env.AMI_ID) {
+                            echo "⚠️ AMI Mismatch! Updating Cluster Parameter Store..."
+                            sh """
+                                aws ssm put-parameter \
+                                    --name "${cluster_param_name}" \
+                                    --value "${env.AMI_ID}" \
+                                    --type "String" \
+                                    --overwrite
+                            """
+                            echo "✅ Updated ${cluster_param_name} to ${env.AMI_ID}"
+                        } else {
+                            echo "✅ AMI is already up-to-date in Cluster Parameter Store."
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('3. Pre-Check: Workload Health') {
+            steps {
+                script {
+                    echo "Checking Workload Health in Target Account: ${params.TARGET_ACCOUNT_ID}..."
+                    // Use Target Role
+                    withAwsRole(params.TARGET_ROLE_ARN) {
+                        // Update Kubeconfig
+                        sh "aws eks update-kubeconfig --name ${params.CLUSTER_NAME} --region ${params.REGION}"
+                        
+                        // Check for non-running pods
+                        def unhealthy_pods = sh(
+                            script: "kubectl get pods -A --field-selector=status.phase!=Running,status.phase!=Succeeded --no-headers || true",
+                            returnStdout: true
+                        ).trim()
+
+                        if (unhealthy_pods) {
+                            echo "⚠️ Warning: Found unhealthy pods before patching:\n${unhealthy_pods}"
+                        } else {
+                            echo "✅ All workloads are healthy."
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('4. Invoke Patching Lambda') {
+            steps {
+                script {
+                    echo "Invoking Lambda ${params.LAMBDA_FUNCTION_NAME}..."
+                    def payload = """
+                    {
+                        "account_id": "${params.TARGET_ACCOUNT_ID}",
+                        "cluster_name": "${params.CLUSTER_NAME}",
+                        "sns_topic_arn": "${params.SNS_TOPIC_ARN}"
+                    }
+                    """
+                    
+                    // Use Hub Role to invoke Lambda
+                    withAwsRole(params.HUB_ROLE_ARN) {
+                        sh "aws lambda invoke --function-name ${params.LAMBDA_FUNCTION_NAME} --payload '${payload}' --cli-binary-format raw-in-base64-out response.json"
+                        
+                        def response = readJSON file: 'response.json'
+                        echo "Lambda Response: ${response}"
+                        
+                        if (response.statusCode != 200) {
+                            error "Lambda execution failed with status code: ${response.statusCode}"
+                        }
+                        
+                        // Parse the body to get details
+                        def body = readJSON text: response.body
+                        env.UPDATE_RESULTS = body.results
+                    }
+                }
+            }
+        }
+
+        stage('5. Monitor Update Status') {
+            steps {
+                script {
+                    echo "Monitoring Node Group Updates in Target Account..."
+                    
+                    // Define the Python monitoring script
+                    def monitorScript = '''
+import boto3
+import time
+import sys
+import subprocess
+import json
+import os
+
+def get_asg_name(cluster_name, nodegroup_name, region):
+    eks = boto3.client('eks', region_name=region)
+    resp = eks.describe_nodegroup(clusterName=cluster_name, nodegroupName=nodegroup_name)
+    asgs = resp['nodegroup']['resources']['autoScalingGroups']
+    if not asgs:
+        print(f"No ASG found for nodegroup {nodegroup_name}")
+        sys.exit(1)
+    return asgs[0]['name']
+
+def get_asg_details(asg_name, region):
+    asg_client = boto3.client('autoscaling', region_name=region)
+    resp = asg_client.describe_auto_scaling_groups(AutoScalingGroupNames=[asg_name])
+    return resp['AutoScalingGroups'][0]
+
+def get_instance_details(instance_ids, region):
+    if not instance_ids:
+        return {}
+    ec2 = boto3.client('ec2', region_name=region)
+    resp = ec2.describe_instances(InstanceIds=instance_ids)
+    instances = {}
+    for r in resp['Reservations']:
+        for i in r['Instances']:
+            instances[i['InstanceId']] = {
+                'State': i['State']['Name'],
+                'LaunchTime': i['LaunchTime'],
+                'PrivateIp': i.get('PrivateIpAddress')
+            }
+    return instances
+
+def get_eks_nodes():
+    try:
+        out = subprocess.check_output(['kubectl', 'get', 'nodes', '-o', 'json'], stderr=subprocess.STDOUT)
+        data = json.loads(out)
+        nodes = {}
+        for item in data['items']:
+            name = item['metadata']['name']
+            conditions = item['status']['conditions']
+            ready = next((c['status'] for c in conditions if c['type'] == 'Ready'), 'False')
+            provider_id = item['spec'].get('providerID', '')
+            instance_id = provider_id.split('/')[-1] if provider_id else 'unknown'
+            nodes[instance_id] = {
+                'Name': name,
+                'Ready': ready,
+                'Version': item['status']['nodeInfo']['kubeletVersion']
+            }
+        return nodes
+    except Exception as e:
+        print(f"Error getting kubectl nodes: {e}")
+        return {}
+
+def monitor_update(cluster_name, nodegroup_name, region):
+    print(f"Starting monitoring for {nodegroup_name} in {cluster_name}...")
+    try:
+        asg_name = get_asg_name(cluster_name, nodegroup_name, region)
+        print(f"Found ASG: {asg_name}")
+    except Exception as e:
+        print(f"Error finding ASG: {e}")
+        return
+
+    while True:
+        print("\\n" + "="*80)
+        print(f"Time: {time.strftime('%H:%M:%S')}")
+        try:
+            asg = get_asg_details(asg_name, region)
+            desired = asg['DesiredCapacity']
+            instances = asg['Instances']
+            instance_ids = [i['InstanceId'] for i in instances]
+            print(f"ASG Status: Desired={desired}, Current={len(instances)}")
+            
+            ec2_details = get_instance_details(instance_ids, region)
+            eks_nodes = get_eks_nodes()
+            
+            print(f"{'Instance ID':<20} {'EC2 State':<15} {'Lifecycle':<15} {'EKS Ready':<10} {'Kube Version':<15}")
+            print("-" * 80)
+            
+            ready_count = 0
+            for i in instances:
+                iid = i['InstanceId']
+                lifecycle = i['LifecycleState']
+                ec2_state = ec2_details.get(iid, {}).get('State', 'Unknown')
+                node_info = eks_nodes.get(iid, {})
+                eks_ready = node_info.get('Ready', 'N/A')
+                kube_ver = node_info.get('Version', '')
+                if eks_ready == 'True':
+                    ready_count += 1
+                print(f"{iid:<20} {ec2_state:<15} {lifecycle:<15} {eks_ready:<10} {kube_ver:<15}")
+
+            eks = boto3.client('eks', region_name=region)
+            ng_resp = eks.describe_nodegroup(clusterName=cluster_name, nodegroupName=nodegroup_name)
+            ng_status = ng_resp['nodegroup']['status']
+            print(f"\\nNode Group Status: {ng_status}")
+            
+            in_service_count = sum(1 for i in instances if i['LifecycleState'] == 'InService')
+            
+            if ng_status == 'ACTIVE' and len(instances) == desired and ready_count == desired and in_service_count == desired:
+                print("\\n✅ Update Complete! All nodes are Active, Ready, and InService.")
+                break
+        except Exception as e:
+            print(f"Error in monitoring loop: {e}")
+        time.sleep(30)
+
+if __name__ == "__main__":
+    if len(sys.argv) < 4:
+        print("Usage: python3 monitor.py <cluster_name> <nodegroup_name> <region>")
+        sys.exit(1)
+    monitor_update(sys.argv[1], sys.argv[2], sys.argv[3])
+'''
+                    
+                    // Write the script to the workspace
+                    writeFile file: 'monitor_eks_update.py', text: monitorScript
+
+                    // Use Target Role to monitor EKS
+                    withAwsRole(params.TARGET_ROLE_ARN) {
+                        def node_groups = sh(
+                            script: "aws eks list-nodegroups --cluster-name ${params.CLUSTER_NAME} --query 'nodegroups[*]' --output text",
+                            returnStdout: true
+                        ).trim().split()
+                        
+                        for (ng in node_groups) {
+                            echo "Checking Node Group: ${ng}"
+                            // Run the embedded script
+                            sh "/opt/venv/bin/python3 -u monitor_eks_update.py ${params.CLUSTER_NAME} ${ng} ${params.REGION}"
+                            echo "✅ Node Group ${ng} update monitoring complete."
+                        }
+                    }
+                    
+                    // Cleanup
+                    sh "rm monitor_eks_update.py"
+                }
+            }
+        }
+
+        stage('6. Post-Check: Workload Health') {
+            steps {
+                script {
+                    echo "Verifying Workloads after Patching..."
+                    // Use Target Role
+                    withAwsRole(params.TARGET_ROLE_ARN) {
+                        sleep 60
+                        
+                        def unhealthy_pods = sh(
+                            script: "kubectl get pods -A --field-selector=status.phase!=Running,status.phase!=Succeeded --no-headers || true",
+                            returnStdout: true
+                        ).trim()
+
+                        if (unhealthy_pods) {
+                            echo "❌ Unhealthy pods found after patching:\n${unhealthy_pods}"
+                            currentBuild.result = 'UNSTABLE'
+                        } else {
+                            echo "✅ All workloads are healthy after patching."
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                def status = currentBuild.currentResult ?: 'SUCCESS'
+                echo "Sending Pipeline Notification via SNS..."
+                
+                // Use Hub Role for SNS
+                withAwsRole(params.HUB_ROLE_ARN) {
+                     sh """
+                        aws sns publish \
+                        --topic-arn ${params.SNS_TOPIC_ARN} \
+                        --subject 'EKS Patching Pipeline: ${status}' \
+                        --message 'Pipeline for Cluster ${params.CLUSTER_NAME} finished with status: ${status}.\\nCheck Jenkins Console for details.'
+                     """
+                }
+            }
+        }
+        failure {
+            script {
+                echo "❌ Pipeline Failed!"
+                // Use Target Role for troubleshooting
+                withAwsRole(params.TARGET_ROLE_ARN) {
+                    sh "kubectl get events --sort-by='.lastTimestamp' || true"
+                    sh "kubectl get pods -A || true"
+                }
+            }
+        }
+        success {
+            echo "✅ EKS Patching Completed Successfully."
+        }
+    }
+}
+
+// Function to assume role
+def withAwsRole(String roleArn, Closure body) {
+    if (!roleArn) {
+        body()
+        return
+    }
+    def roleJson = sh(script: "aws sts assume-role --role-arn ${roleArn} --role-session-name JenkinsSession --output json", returnStdout: true).trim()
+    def accessKey = readJSON(text: roleJson).Credentials.AccessKeyId
+    def secretKey = readJSON(text: roleJson).Credentials.SecretAccessKey
+    def sessionToken = readJSON(text: roleJson).Credentials.SessionToken
+    
+    withEnv(["AWS_ACCESS_KEY_ID=${accessKey}", "AWS_SECRET_ACCESS_KEY=${secretKey}", "AWS_SESSION_TOKEN=${sessionToken}", "AWS_PROFILE="]) {
+        body()
+    }
+}
