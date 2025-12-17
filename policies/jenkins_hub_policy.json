@@ -1,0 +1,44 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "SSMReadAccess",
+            "Effect": "Allow",
+            "Action": [
+                "ssm:GetParameter",
+                "ssm:GetParameters"
+            ],
+            "Resource": [
+                "arn:aws:ssm:*:*:parameter/eks-golden-image*",
+                "arn:aws:ssm:*:*:parameter/eks-ami/*"
+            ]
+        },
+        {
+            "Sid": "LambdaInvokeAccess",
+            "Effect": "Allow",
+            "Action": [
+                "lambda:InvokeFunction"
+            ],
+            "Resource": [
+                "arn:aws:lambda:*:*:function:EKS-NodeGroup-Patcher",
+                "arn:aws:lambda:*:*:function:AMI-Creator-Function"
+            ]
+        },
+        {
+            "Sid": "SNSPublishAccess",
+            "Effect": "Allow",
+            "Action": [
+                "sns:Publish"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "EC2ReadAccess",
+            "Effect": "Allow",
+            "Action": [
+                "ec2:DescribeImages"
+            ],
+            "Resource": "*"
+        }
+    ]
+}

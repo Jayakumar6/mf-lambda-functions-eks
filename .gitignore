@@ -2,3 +2,4 @@
 *.json
 .DS_Store
 Creator-resources.txt
+!policies/*.json
